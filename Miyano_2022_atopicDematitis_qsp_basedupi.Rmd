@@ -1,0 +1,1006 @@
+---
+title: "Adaptation of AD QSP model to include PopPK implementation for STEP Tutorial"
+author: "Blerta Shtylla and Luke Fostvedt"
+date: "09/24/2026"
+params:
+  answers: false
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+    theme: flatly
+    highlight: tango
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = FALSE, fig.width = 7, fig.height = 4.5)
+library(nlmixr2lib)
+library(rxode2)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+library(purrr)
+library(mvtnorm)
+library(tidyverse)
+show_answers <- TRUE
+```
+
+This document can be rendered in two modes. The default (`params$answers = FALSE`) shows only the exercise prompts. Rendering with `rmarkdown::render("Miyano_2022_atopicDermatitis_qsp.Rmd", params = list(answers = TRUE))` additionally reveals a worked "Suggested answer" after each exercise.
+
+Source: [nlmixr2lib vignette](https://nlmixr2.github.io/nlmixr2lib/articles/Miyano_2022_atopicDermatitis_qsp.html) ([Rmd source](https://github.com/nlmixr2/nlmixr2lib/blob/main/vignettes/articles/Miyano_2022_atopicDermatitis_qsp.Rmd))
+
+## Introduction
+
+This tutorial adapts the nlmixr2lib QSP vignette for the Miyano 2022 atopic dermatitis model into a hands-on exercise at the interface of quantitative systems pharmacology (QSP) and pharmacometrics (PMx). Three references anchor the material:
+
+| # | Reference | Role in this tutorial |
+|---|---|---|
+| 1 | Miyano T, Irvine AD, Tanaka RJ. A mathematical model to identify optimal combinations of drug targets for dupilumab poor responders in atopic dermatitis. Allergy. 2022;77(2):582-594. doi:[10.1111/all.14870](https://doi.org/10.1111/all.14870), PubMed:[33894014](https://pubmed.ncbi.nlm.nih.gov/33894014/) | Source QSP model: 14-state atopic-dermatitis pathogenesis model with 51 log-normal between-patient parameters and 9 fixed-inhibition drug-effect modules, reproduced below. |
+| 2 | [nlmixr2lib "Miyano 2022 atopic dermatitis QSP" vignette](https://nlmixr2.github.io/nlmixr2lib/articles/Miyano_2022_atopicDermatitis_qsp.html) ([Rmd source](https://github.com/nlmixr2/nlmixr2lib/blob/main/vignettes/articles/Miyano_2022_atopicDermatitis_qsp.Rmd)) | Base tutorial this document extends: THETA/OMEGA/ETA terminology bridge, steady-state check, Figure 3B/3C reproduction, and the illustrative dupilumab PopPK submodel used throughout. |
+| 3 | Kovalenko P, DiCioccio AT, Davis JD, et al. Exploratory Population PK Analysis of Dupilumab, a Fully Human Monoclonal Antibody Against IL-4R(alpha), in Atopic Dermatitis Patients and Normal Volunteers. CPT Pharmacometrics Syst Pharmacol. 2016;5(11):617-624. doi:[10.1002/psp4.12136](https://doi.org/10.1002/psp4.12136), PMID:[27778477](https://pubmed.ncbi.nlm.nih.gov/27778477/) | Real, published dupilumab population-PK analysis (2-compartment, parallel linear + Michaelis-Menten target-mediated elimination, ~50% bioavailability). Used below as a provenance check on the illustrative one-compartment PK submodel's structural assumptions, and as the reference a learner would consult before building a production PopPK model for this drug. |
+
+In this tutorial you will work through five exercises (an answer key is available -- see the render-mode note above):
+
+1. **Test an alternative virtual-population (Vpop) sampling distribution** for one of the 51 QSP parameters, and compare the resulting patient heterogeneity to the model's built-in log-normal assumption (see "Visualizing THETA, ETA, and between-patient variability" below).
+2. **Build a correlated Vpop sampling block** for three Th2-pathway QSP parameters that this model's fully-diagonal OMEGA cannot represent on its own, and see how that correlation does -- and does not -- propagate into simulated cytokine heterogeneity (see "Correlated Vpop sampling" below).
+3. **Compare a fixed-inhibition vs. a PK-driven drug-effect mechanism** at a matched dose, using the joint PopPK + QSP virtual-patient roster built in this tutorial (see "Building a joint virtual-patient roster" below).
+4. **Check the illustrative one-compartment dupilumab PopPK submodel's structure** against the real published PK structure reported by Kovalenko 2016, and sketch what a structurally faithful rxode2 model would need (see "Kovalenko structural check" below).
+5. **Simulate a multi-dose dose-response curve** with the integrated PopPK + QSP model, sweeping real dupilumab doses through the joint roster from exercise 3, and reflect on open design questions for PK-QSP integration (see "Dose-response exercise" below).
+
+## The QSP base model: source, steady state, and clinical-endpoint reproduction
+
+This section establishes the QSP base model end-to-end, in one place: what the model represents and where its equations and 51 between-patient parameters come from, the two model objects used throughout this document, confirmation that the model settles into a stable steady state, how the modelled virtual population is defined, how drug effect is actually encoded in the published model (a fixed inhibition fraction, not a PK submodel), and how well the resulting simulations reproduce the paper's own clinical-trial figures (3B and 3C) and their caveats. The rest of this tutorial builds on this foundation: first with Vpop-sampling exercises on the QSP parameters themselves, then with an illustrative PopPK submodel that links dupilumab's simulated concentration to this same drug-effect mechanism.
+
+### Model and source
+
+- Citation: Miyano T, Irvine AD, Tanaka RJ. A mathematical model to identify optimal combinations of drug targets for dupilumab poor responders in atopic dermatitis. Allergy. 2022;77(2):582-594.
+- Article: https://doi.org/10.1111/all.14870
+- PubMed: https://pubmed.ncbi.nlm.nih.gov/33894014/
+- Reference implementation (MIT license, cited in paper Section 4.6): https://github.com/Tanaka-Group/AD_QSP_model
+- Real published dupilumab population-PK reference, used as a provenance check on the illustrative PopPK submodel below (not the source of this QSP model's own parameters): Kovalenko P, DiCioccio AT, Davis JD, et al. Exploratory Population PK Analysis of Dupilumab, a Fully Human Monoclonal Antibody Against IL-4R(alpha), in Atopic Dermatitis Patients and Normal Volunteers. CPT Pharmacometrics Syst Pharmacol. 2016;5(11):617-624. doi:10.1002/psp4.12136, PMID:27778477.
+
+Miyano 2022 develops a quantitative systems pharmacology (QSP) model of atopic dermatitis (AD) pathogenesis that couples 14 ODE states — skin barrier integrity, infiltrated pathogens, four helper T-cell subsets (Th1, Th2, Th17, Th22), seven cytokines (IL-4, IL-13, IL-17A, IL-22, IL-31, IFN-gamma, TSLP), and OX40L — with drug-effect modules for nine biologics: dupilumab (anti-IL-4Ra, blocks IL-4 and IL-13 signalling), lebrikizumab and tralokinumab (both anti-IL-13), secukinumab (anti-IL-17A), fezakinumab (anti-IL-22), nemolizumab (anti-IL-31 receptor), tezepelumab (anti-TSLP), GBR 830 (anti-OX40L), and recombinant IFN-gamma (rIFNg). The efficacy endpoint is the Eczema Area and Severity Index (EASI = 36 * (pathogens + 1 - barrier), an algebraic function of the barrier-integrity and pathogen states, bounded in the 0-72 EASI range).
+
+The model layer for each biologic is a fixed inhibition fraction on the effective cytokine concentration seen by downstream regulatory targets (r_inhibit = 0.99 for antibodies, r_inhibit = 0.44 for tralokinumab from an e_a2 = 0.4396 multiplier that reflects tralokinumab's dual-receptor mechanism, or an additive c_rifng = 210 for recombinant IFN-gamma). Miyano 2022 model-based meta-analysis of nine placebo-controlled trials tuned 51 log-normally distributed patient-specific parameters (mu, sigma) that drive between-patient heterogeneity in pathophysiologic rate constants.
+
+The per-parameter origin is recorded as an in-file comment next to each `ini()` entry in `inst/modeldb/therapeuticArea/Miyano_2022_atopicDermatitis_qsp.R`. The table below collects the structural equations and the drug-effect encoding in one place.
+
+| Element | Source |
+|---|---|
+| 14 ODEs (skin barrier, pathogens, Th1-Th22, 7 cytokines, OX40L) | Paper Sec 2.2 (14 ODEs, 51 parameters); reference implementation AD_QSP_model.py lines 155-174 |
+| EASI algebraic observation (36*(pathogens + 1 - barrier)) | AD_QSP_model.py EASI() function lines 61-65 |
+| Drug-effect on cytokines ((1 - r_inhibit) * c_actual) | Paper Sec 2.3 (r_inhibit = 0.99 for antibodies) |
+| Tralokinumab e_a2 = 0.4396 multiplier | Paper Sec 4.2 (Discussion, "e_a2 = 0.44"); AD_QSP_model.py line 140 |
+| rIFNg additive skin concentration (c_rifng = 210) | Paper Sec 2.3 (Eq. for c_IFNg); AD_QSP_model.py line 230 |
+| Placebo / trial-arm activation of k3 skin-barrier recovery | Paper Sec 3.3 ("k3 corresponds to placebo effects"); AD_QSP_model.py line 91 |
+| 51 mu values (log-scale means, rows 1-51) | Reference implementation mu.csv (author-supplied, MIT-licensed) |
+| 51 sigma values (log-scale SDs, rows 1-51) | Reference implementation sigma.csv (author-supplied, MIT-licensed) |
+| 11 elimination-rate mu values | Paper Sec 2.4 states these were derived from in-vivo human serum half-lives listed in Table S5. Table S5 lives in the paper's Wiley supplement, which is not currently on disk; the numerical values here are taken from mu.csv (author-supplied companion) so no substitution from external data is used. |
+| Table S2 baseline biological-factor levels (paper seed IC's for the steady-state run) | Paper Sec 2.4 references Table S2; the numerical seed values (0.5931, 0.4069, 3.1, …) are reproduced from AD_QSP_model.py lines 183-198. |
+| 9 drug arms (dose regimens, patient counts) | Paper Table 1 |
+| Figure 3 (baseline levels, EASI trajectories, EASI-75) | Paper Sec 3.2, Figure 3 |
+
+### Loading the model
+
+The model is loaded once here and used throughout the rest of this document via two objects: `mod` (the full model, with all 51 between-patient random effects active) and `mod_typ` (the same model with `rxode2::zeroRe()` applied, i.e. every random effect fixed at exactly 0 — the "typical patient" used for the steady-state and clinical-endpoint checks below). The THETA/OMEGA/ETA naming convention behind these random effects is unpacked in "Parameter terminology and Vpop sampling" later in this document; for now it is enough to know that `mod_typ` reproduces the population-typical trajectory with no patient-to-patient variability, while `mod` samples a fresh set of 51 parameter deviations per simulated patient.
+
+```{r load-model}
+mod <- readModelDb("Miyano_2022_atopicDermatitis_qsp")
+mod_typ <- mod |> rxode2::zeroRe()
+```
+
+### Steady-state check (typical patient)
+
+The paper simulates 1000 weeks of drug-free evolution to establish the model's steady state, then applies drug at t = 0 of the trial. The vignette replicates that steady-state run for the typical patient (`zeroRe()`, i.e. all etas set to zero, using the `mod_typ` object created above) and confirms the state settles into a stable attractor. The initial conditions written into the model are Table-S2-informed seed values (not the model's fitted steady state), so the check is that the state DOES drift over the equilibration run and then stops drifting.
+
+```{r steady-state}
+# Steady-state run: no drug, 1000 weeks, weekly observations. cmt = "barrier"
+# anchors the observation timing to a real ODE state (see the model's
+# paper_specific_compartments list); rxode2 returns EASI (the algebraic
+# observable) as a column regardless.
+ev_ss <- rxode2::et(seq(0, 1000, by = 4)) |>
+  rxode2::et(id = 1L)
+ev_ss$cmt <- "barrier"
+
+ss <- rxode2::rxSolve(mod_typ, events = ev_ss) |> as.data.frame()
+tail(ss[, c("time", "barrier", "pathogens", "il13", "th2", "EASI")], 5)
+```
+
+At t = 1000 weeks the typical-patient steady-state EASI should sit in the moderate-to-severe range consistent with the modelled AD population (Miyano 2022 Figure 3A baselines). The virtual population that the full model (`mod`, as opposed to the typical-patient `mod_typ` used above) samples from is described next.
+
+```{r steady-state-plot}
+ss |>
+  dplyr::filter(time <= 200) |>
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = EASI, colour = "EASI")) +
+  geom_line(aes(y = 20 * barrier, colour = "20*barrier")) +
+  geom_line(aes(y = pathogens, colour = "pathogens")) +
+  scale_colour_manual(values = c("EASI" = "black", "20*barrier" = "steelblue", "pathogens" = "firebrick")) +
+  labs(x = "Time (weeks)", y = "State value",
+       colour = NULL,
+       title = "Typical-patient equilibration to steady state",
+       caption = "Drift-and-settle from Table-S2 seed IC's to the model's fitted attractor.")
+```
+
+### Population
+
+The QSP layer describes system-level AD pathogenesis independently of individual demographics. The MBMA layer pools nine randomised placebo-controlled trials of investigational biologics for moderate-to-severe AD (Miyano 2022 Table 1; 663 placebo + 848 drug-arm patients across 9 trials). Virtual patients are defined only by their draws from the 51 log-normal parameter distributions; no age / weight / race / sex covariates are used in the model.
+
+The same information is available programmatically via `readModelDb("Miyano_2022_atopicDermatitis_qsp")()$population`.
+
+### How PK was incorporated in the Miyano et al QSP paper
+
+Before reproducing Figure 3B, it is worth being explicit about how Miyano et al. (2022) actually incorporated PK into their published QSP model, because it is a much simpler mechanism than a population-PK model provides: **they didn't include one.**
+
+There is no PK compartment, dose, or absorption/distribution/elimination process for any of the nine biologics. Each drug arm is instead a **constant, patient-independent inhibition fraction** applied for the entire 24-week trial window, starting at t = 0. Concretely (reference implementation `AD_QSP_model.py`, drug-effect block, lines ~143-148):
+
+```python
+IL4  = (1 - de[1]) * c[6]
+IL13 = (1 - de[2] * ea2) * c[7]   # ea2 = 0.4396 for tralokinumab, else 1
+IL17 = (1 - de[3]) * c[8]
+IL22 = (1 - de[4]) * c[9]
+IL31 = (1 - de[5]) * c[10]
+TSLP = (1 - de[6]) * c[12]
+OX40 = (1 - de[7]) * c[13]
+IFNg = c[11] + de[8]              # additive, not multiplicative
+```
+
+In the `ini()`/`model()` DSL used throughout this vignette, `de[1]` through `de[7]` are the `r_il4`, `r_il13`, ..., `r_ox40l` parameters (0.99 for full antibody blockade, 0 for no effect), and `de[8]` is `c_rifng` (additive rIFNg skin concentration). Three consequences follow directly from this design:
+
+- **Step-function onset.** The inhibition fraction is either "on" (0.99) or "off" (0) — there is no ramp-up while a drug distributes and reaches its target, because there is no distribution to model. A virtual patient's cytokine inhibition is exactly as strong in week 1 as it is in week 24.
+- **No between-patient PK variability.** `r_il4`, `r_il13`, etc. are `fixed()` THETAs in `ini()` — every patient in an arm receives the identical value. All of the patient-to-patient heterogeneity you see in the spaghetti plot above comes entirely from the 51 QSP-mechanism ETAs (skin barrier turnover, Th-cell differentiation, cytokine production, ...), never from variability in how much drug reaches its target.
+- **Not the same thing as the cytokine elimination-rate parameters.** The model does contain 11 real elimination-rate constants (`ld1`, `ld8`, `ld9`-`ld17`; Table S5-sourced half-lives) — but these describe how fast the *cytokines themselves* (IL-4, IL-13, ...) are cleared from the physiological system once produced, not how fast the *drug* is cleared from the body. There is no analogous drug-clearance parameter anywhere in this model.
+
+This is a defensible simplification for reproducing steady-state efficacy endpoints (mean EASI, EASI-75 at 24 weeks) from a model-based meta-analysis, since it collapses drug PK and target engagement into one tuned scalar per drug. It does mean the model cannot answer PK-linked questions -- dose/schedule optimization, missed-dose sensitivity, or how much of the response lags behind absorption -- the way a real population-PK/PD model would.
+
+The dedicated PK section at the end of this vignette ("Illustrative Dupilumab population PK") builds a real THETA/OMEGA/ETA-based one-compartment PopPK submodel for dupilumab, links its simulated concentration to a time-varying version of `r_il4`/`r_il13`, and compares the resulting EASI-75 trajectory against this fixed-inhibition mechanism for the same virtual cohort.
+
+### Reproduce Figure 3B: mean EASI trajectories for the 9 drugs
+
+Each drug corresponds to a distinct setting of the drug-scenario parameters exposed in `ini()`. One events dataframe is built per drug arm (typical patient, weekly observations, no dosing events because the model treats drug exposure as a constant inhibition fraction applied for the whole treatment period).
+
+```{r drug-params}
+# Drug-scenario parameter table. Each row = one arm. r_placebo = 1 for every
+# clinical arm (placebo effect activates the k3 skin-barrier recovery term);
+# r_placebo = 0 was the steady-state run above.
+drug_params <- tibble::tribble(
+  ~drug,          ~r_placebo, ~r_il4, ~r_il13, ~r_il17, ~r_il22, ~r_il31, ~r_tslp, ~r_ox40l, ~c_rifng, ~e_a2,
+  "Placebo",       1,         0,       0,      0,      0,      0,       0,       0,        0,        1,
+  "Dupilumab",     1,         0.99,   0.99,    0,      0,      0,       0,       0,        0,        1,
+  "Lebrikizumab",  1,         0,      0.99,    0,      0,      0,       0,       0,        0,        1,
+  "Tralokinumab",  1,         0,      0.99,    0,      0,      0,       0,       0,        0,        0.4396,
+  "Secukinumab",   1,         0,       0,     0.99,    0,      0,       0,       0,        0,        1,
+  "Fezakinumab",   1,         0,       0,      0,     0.99,    0,       0,       0,        0,        1,
+  "Nemolizumab",   1,         0,       0,      0,      0,     0.99,     0,       0,        0,        1,
+  "Tezepelumab",   1,         0,       0,      0,      0,      0,      0.99,     0,        0,        1,
+  "GBR830",        1,         0,       0,      0,      0,      0,       0,      0.99,      0,        1,
+  "rIFNg",         1,         0,       0,      0,      0,      0,       0,       0,        210,      1
+)
+```
+
+The equilibrated typical-patient steady state (from the previous chunk) is used as the initial condition for every drug arm (i.e. the model settles for 1000 weeks with no drug, then starts the trial). Simulating for 24 weeks matches the paper's efficacy-endpoint window.
+
+```{r drug-arms}
+# Take the last row of the ss run as the equilibrated baseline. It has the
+# 14 state columns.
+state_cols <- c("barrier", "pathogens", "th1", "th2", "th17", "th22",
+                "il4", "il13", "il17", "il22", "il31", "ifng", "tslp", "ox40l")
+baseline_typ <- ss[nrow(ss), state_cols, drop = FALSE]
+
+typical_by_drug <- function(row) {
+  ev <- rxode2::et(seq(0, 24, by = 0.5)) |> rxode2::et(id = 1L)
+  ev$cmt <- "barrier"
+  p <- as.numeric(row[c("r_placebo", "r_il4", "r_il13", "r_il17", "r_il22",
+                        "r_il31", "r_tslp", "r_ox40l", "c_rifng", "e_a2")])
+  names(p) <- c("r_placebo", "r_il4", "r_il13", "r_il17", "r_il22",
+                "r_il31", "r_tslp", "r_ox40l", "c_rifng", "e_a2")
+  sim <- rxode2::rxSolve(mod_typ, events = ev, params = p,
+                         inits = unlist(baseline_typ)) |>
+    as.data.frame()
+  sim$drug <- row[["drug"]]
+  sim
+}
+
+typ_all <- purrr::map_dfr(seq_len(nrow(drug_params)), function(i)
+  typical_by_drug(drug_params[i, ]))
+
+# Compute %improved EASI relative to each drug's own baseline (t = 0 within
+# the trial). The paper's Figure 3B shows %improved EASI over time.
+typ_all <- typ_all |>
+  group_by(drug) |>
+  mutate(pct_improved_EASI = 100 * (first(EASI) - EASI) / first(EASI)) |>
+  ungroup()
+```
+
+```{r figure3B, fig.width=8, fig.height=5}
+ggplot(typ_all, aes(x = time, y = pct_improved_EASI, colour = drug)) +
+  geom_line(linewidth = 0.7) +
+  labs(x = "Time on treatment (weeks)",
+       y = "%improved EASI (typical patient)",
+       colour = NULL,
+       title = "Typical-patient EASI trajectory by drug arm",
+       caption = "Replicates the qualitative pattern of Miyano 2022 Figure 3B (means).")
+```
+
+The relative ordering (dupilumab and lebrikizumab -> highest efficacy; secukinumab and rIFNg -> smallest EASI improvement) reproduces the Figure 3B pattern qualitatively.
+
+> **Caveat:** the exact numerical trajectories in the paper are population means with IIV, not typical-patient projections as plotted here.
+
+### Small virtual-patient cohort for EASI-75
+
+For a stochastic cohort simulation, a virtual population (50 patients) is sampled and a single long trajectory per patient per drug arm is simulated: the first 1000 weeks equilibrate without drug (r_placebo = 0), then the drug switches on at week 1000. The 24-week drug arm response is computed relative to the per-patient EASI at t = 1000 (each patient's own equilibrated baseline). Cohort cap: 200 per arm; the vignette uses 50 per arm x 10 arms = 500 patient-arms.
+
+Rather than time-varying drug covariates, 2 sims are run per patient per drug: an initial no-drug 1000-week equilibration (shared across all drugs), then a 24-week drug arm from the shared typical baseline. Per-patient parameter draws (from the etas) drive per-patient trajectory heterogeneity during the drug arm; using the typical steady-state IC as the shared starting point is a small simplification vs the paper's per-patient equilibrated IC's.
+
+```{r cohort-sim}
+n_per_arm <- 50L
+mod_stoch <- mod  # keeps eta variability
+
+# Use the typical-patient equilibrated state as the shared IC for all
+# virtual patients in every drug arm. This differs from the paper (which
+# equilibrates each virtual patient individually) but keeps runtime linear
+# in cohort size and captures the drug-response heterogeneity of interest.
+baseline_typ_named <- as.numeric(baseline_typ[1, ])
+names(baseline_typ_named) <- names(baseline_typ)
+
+sim_arm <- function(drug_row) {
+  ev <- rxode2::et(seq(0, 24, by = 1)) |>
+    rxode2::et(id = seq_len(n_per_arm))
+  ev$cmt <- "barrier"
+  p <- as.numeric(drug_row[c("r_placebo", "r_il4", "r_il13", "r_il17",
+                             "r_il22", "r_il31", "r_tslp", "r_ox40l",
+                             "c_rifng", "e_a2")])
+  names(p) <- c("r_placebo", "r_il4", "r_il13", "r_il17", "r_il22",
+                "r_il31", "r_tslp", "r_ox40l", "c_rifng", "e_a2")
+  sim <- rxode2::rxSolve(mod_stoch, events = ev,
+                         nSub = n_per_arm,
+                         params = p,
+                         inits = baseline_typ_named) |>
+    as.data.frame()
+  sim$drug <- drug_row[["drug"]]
+  sim
+}
+
+cohort_all <- purrr::map_dfr(seq_len(nrow(drug_params)), function(i)
+  sim_arm(drug_params[i, ]))
+
+# %improved EASI relative to each patient's t = 0 (in-arm) baseline.
+baseline_easi <- cohort_all |>
+  dplyr::filter(time == 0) |>
+  dplyr::select(drug, id, EASI_baseline = EASI)
+cohort_all <- cohort_all |>
+  dplyr::left_join(baseline_easi, by = c("drug", "id")) |>
+  dplyr::mutate(pct_improved = 100 * (EASI_baseline - EASI) / EASI_baseline)
+```
+
+```{r figure3C, fig.width=8, fig.height=5}
+# EASI-75: fraction of patients per arm per timepoint achieving >75% EASI improvement.
+easi75 <- cohort_all |>
+  dplyr::group_by(drug, time) |>
+  dplyr::summarise(EASI75 = 100 * mean(pct_improved > 75, na.rm = TRUE),
+                   .groups = "drop")
+
+ggplot(easi75, aes(x = time, y = EASI75, colour = drug)) +
+  geom_line(linewidth = 0.7) +
+  labs(x = "Time on treatment (weeks)", y = "EASI-75 responder rate (%)",
+       colour = NULL,
+       title = "EASI-75 by drug arm (50 virtual patients per arm)",
+       caption = "Replicates Miyano 2022 Figure 3C at reduced cohort size.")
+```
+
+At week 24, the ordering matches the paper's Figure 3C (dupilumab and lebrikizumab -> highest EASI-75 responder rate; secukinumab and rIFNg near the bottom).
+
+> **Caveat:** exact numerical agreement requires the paper's 1000-per-arm cohort and 1000 repeated simulated trials (Figure 3 caption); the vignette's 50-per-arm point estimate is illustrative, not a statistical reproduction.
+
+### Assumptions and deviations
+
+The callouts above flag the two caveats most likely to affect what you see in the figures (cohort size, typical-patient vs. population means). The full list of data-provenance and modelling assumptions behind this section is collected below for reference.
+
+<details>
+<summary>Click to expand: full list of assumptions and deviations</summary>
+
+- Paper supplement (SI Section 3 with the S1 Table of ODEs, Table S3 with r_inhibit derivations, Tables S4/S5 with the 51 mu and sigma parameter values) is not currently on disk. The parameter values (mu.csv, sigma.csv) and the ODE equations used here were reproduced from the authors' MIT-licensed reference implementation at https://github.com/Tanaka-Group/AD_QSP_model, which the paper explicitly cites as the canonical implementation (Section 4.6: "The code of the QSP model is available at …"). The failed auto-acquisition of the Wiley supplement is recorded in `needs_acquisition.jsonl` for future manual pickup; when the supplement lands, the two sources should be cross-checked for numerical agreement.
+- Table S3 r_inhibit derivations from IC50 and skin drug concentrations are not on disk. The r_inhibit = 0.99 for antibodies and r_inhibit = 0.44 for tralokinumab (via e_a2 = 0.4396) are used as stated in the paper's Section 2.3 and Section 4.2 respectively; the derivations of these two values from IC50 + skin concentration data (paper Section 3.4 and Table S3) cannot be independently verified from the on-disk sources.
+- Table S5 elimination-rate half-lives are not on disk. The paper states these were derived from published in-vivo human serum half-lives. The numerical mu values used for `ld1`, `ld8`, `ld9`, `ld10-d17` come from `mu.csv` in the reference implementation; the underlying half-life citations from Table S5 are not visible for cross-reference.
+- Vignette skips PKNCA. The paper's efficacy endpoint (EASI-75 at 24 weeks) is not an NCA quantity; there is no dose-and-eliminate PK profile to integrate. Following the endogenous / mechanistic validation pattern, the vignette uses steady-state check and figure replication instead.
+- Between-patient variability interpretation. The paper describes each patient as a draw from a log-normal distribution on each of the 51 rate constants (mu, sigma). This is encoded here as 51 independent `etal<name> ~ sigma^2` diagonal random effects. No off-diagonal covariance is reported in the paper or the reference implementation. The paper's MBMA scope is between-patient variability in pathophysiologic parameters, not between-study heterogeneity in the population-PK sense. "Correlated Vpop sampling" below builds one illustrative, biologically-motivated exception to this diagonal-OMEGA assumption (a Th2-pathway cytokine-production block) purely to demonstrate the technique and its downstream effect; the correlation itself is not estimated from data and is not used anywhere else in this document except where explicitly built into `vpop_roster`.
+- Drug-effect parameters exposed as `ini()` overrides. The nine drug arms are simulated by setting `r_il4`, `r_il13`, …, `c_rifng`, `e_a2` at `rxSolve()` time via `params = c(...)`. Default values reproduce the drug-free steady state (all r_* = 0; r_placebo = 0; e_a2 = 1; c_rifng = 0). Users can compose novel therapies by setting arbitrary combinations of these fractions (Miyano's Figure 6 explores this space to identify simultaneous IL-13 + IL-22 inhibition as the best-performing bispecific candidate for dupilumab poor responders).
+- Vignette cohort size. The vignette uses n = 50 per arm to stay inside the pkgdown render time budget. The paper's Figure 3 uses 1000 virtual patients per arm and 1000 repeated simulated trials for 95% CIs. The qualitative shape (drug ordering, response-rate direction) reproduces at n = 50; the exact numerical Figure-3 CIs do not.
+- PK-specific assumptions (illustrative THETA/OMEGA magnitudes, arbitrary concentration units, PK-QSP eta independence) are listed separately, next to the PK submodel that they apply to (see "Assumptions specific to this illustrative PK section" below "Illustrative Dupilumab population PK"), rather than duplicated here.
+
+</details>
+
+## Parameter terminology and Vpop sampling
+
+### mu, sigma, and eta (a naming bridge)
+
+Before reaching for software vocabulary, it helps to anchor on a general, software-agnostic distinction between two *levels* of noise that any population model separates: **patient-variability-level noise** and **measurement-level noise**. Patient-variability-level noise (also called between-subject variability, or BSV) is variability in the parameters that govern each individual's own dynamics — two patients running the exact same ODE structure but with different rate constants. Measurement-level noise (residual/observation error) is variability between what the model predicts for one individual and what is actually observed for that same individual at that same time point — assay noise, timing imprecision, or unmodeled short-term fluctuation. This QSP model only has the first kind: the 51 log-normal parameter draws (`mu`, `sigma`) create between-patient variability, and from there each patient's ODEs are solved deterministically, with no measurement-noise layer added on top of the prediction.
+
+With that concept in place, the software vocabulary below is one continuous lineage, not two competing conventions: NONMEM's classic `$THETA`/`$OMEGA`/`$ETA`/`$SIGMA` control-stream records defined this naming decades ago for population PK/PD, and nlmixr2's R-native `ini()`/`model()` DSL (compiled to an ODE solver by rxode2) deliberately reuses those same four words so PMx modelers feel at home — it isn't a rival naming scheme. The paper's own `mu.csv`/`sigma.csv` files, however, predate and are independent of that PMx vocabulary, and happen to reuse the word "sigma" for something that maps onto a *different* one of the four NONMEM/nlmixr2 terms. That's the collision worth untangling:
+
+- **QSP Terminology: mu/sigma** (Miyano 2022 reference implementation, `mu.csv`/`sigma.csv`): for each of the 51 rate constants, `mu` is the log-scale population mean and `sigma` is the log-scale standard deviation describing between-patient (patient-variability-level) variability in that rate constant.
+- **PMx Terminology: THETA/OMEGA/ETA** (nlmixr2's `ini()` block, compiled by rxode2): `mu` becomes a log-scale THETA (e.g. `lk1 <- 0.537`), and `sigma` is folded into the variance of an ETA (e.g. `etalk1 ~ 0.628849`, where `0.628849 = 0.793^2`) — i.e. the paper's sigma lands in NONMEM's OMEGA slot, not its SIGMA slot, despite the name overlap. Each patient's rate constant is then reconstructed as `k1 <- exp(lk1 + etalk1)` in `model()`.
+- **PMx Terminology: SIGMA** (residual/observation error variance): a different concept from either of the above — measurement or assay noise added on top of an individual prediction when fitting observed data. It's absent from this model entirely, since this QSP model has no measurement/observation-error layer; it only ever reports the deterministic EASI trajectory computed from the ODE states. This is why rxode2 prints `Warning message: No sigma parameters in the model` when you load it: that warning refers to this inherited NONMEM SIGMA slot being empty, not to the paper's `sigma.csv` (which, again, nlmixr2 compiles into OMEGA/ETA instead).
+
+The table below anchors on the four canonical PMx building blocks (THETA, OMEGA, ETA, and residual-error SIGMA) as the primary key, since these are the exact terms you'll meet again when sampling a population PK model — only the paper's QSP-specific naming changes underneath them.
+
+| PMx Term | This model's notation | QSP Term (paper) | Role |
+|---|---|---|---|
+| Individual parameter | `k1 <- exp(lk1 + etalk1)` | the patient-specific rate constant | What actually enters `d/dt(...)` for that patient |
+| THETA (fixed effect) | `lk1` | `mu` (mu.csv, log scale) | Population-typical value of the rate constant |
+| ETA (random effect) | `etalk1` | not named separately in the paper — implicit in "patients sampled from mu, sigma" | One virtual patient's deviation, drawn ~ N(0, OMEGA) |
+| OMEGA (variance) | `0.628849` in `etalk1 ~ 0.628849` | `sigma^2` (sigma.csv, squared) | Between-patient variability of that rate constant |
+| SIGMA (residual error) | absent — no `sigma()` block here | n/a — no measurement/observation layer in this QSP model | Measurement-level noise (absent here); do not confuse with the paper's `sigma.csv`, which is patient-variability-level noise mapped to OMEGA above, not this |
+
+`zeroRe()` sets every ETA to exactly 0, so all 51 rate constants collapse to their THETA (population `mu`) values — this is the "typical patient" used in the steady-state check above. The cohort-simulation section above keeps the ETAs active (a fresh random draw per virtual patient, `nSub = n_per_arm`) to generate patient-to-patient heterogeneity.
+
+### Visualizing THETA, ETA, and between-patient variability
+
+The THETA/OMEGA/ETA machinery above becomes concrete once it's sampled. Two figures below reuse the model's first parameter (`k1`, skin barrier recovery rate) and the two model objects created earlier in this tutorial (see "Loading the model" above): `mod` (full between-patient variability) and `mod_typ` (the same model with `zeroRe()`, i.e. all etas fixed at 0 — the "typical patient" used throughout the rest of this document).
+
+The first figure samples 300 virtual patients' `etalk1` draws directly (without solving any ODEs) and shows both the raw ETA (log scale, centred on 0) and the resulting individual `k1` (natural scale, log-normal, centred on the THETA-derived typical value):
+
+```{r theta-eta-distribution, fig.width=8, fig.height=4}
+set.seed(123)
+n_demo <- 300
+lk1 <- 0.537
+omega_k1 <- 0.628849  # = 0.793^2; sigma.csv row 1 squared -> etalk1 ~ 0.628849 in ini()
+
+eta_k1 <- rnorm(n_demo, mean = 0, sd = sqrt(omega_k1))
+k1_indiv <- exp(lk1 + eta_k1)
+k1_typical <- exp(lk1)
+cat("Typical-patient k1 =", k1_typical, "\n")
+
+df_theta_eta <- rbind(
+  data.frame(quantity = "ETA (etalk1, log scale)", value = eta_k1),
+  data.frame(quantity = "individual k1 = exp(lk1 + etalk1)", value = k1_indiv)
+)
+
+ggplot(df_theta_eta, aes(x = value)) +
+  geom_histogram(bins = 40, fill = "steelblue", alpha = 0.7, colour = "white") +
+  facet_wrap(~ quantity, scales = "free", nrow = 1) +
+  labs(x = NULL, y = "Count",
+       title = "THETA + ETA -> individual parameter (300 simulated virtual patients)",
+       subtitle = paste0("ETA ~ N(0, OMEGA = ", round(omega_k1, 3), "); typical-patient k1 = exp(lk1) = ", round(k1_typical, 3)))
+```
+
+The same random ETAs that produced this parameter-level spread propagate through all 14 ODEs to produce different simulated trajectories per virtual patient, even though every patient shares identical THETAs. The second figure simulates 12 virtual patients (fresh ETA draws, `mod`) alongside the typical patient (`mod_typ`, all ETAs = 0):
+
+```{r theta-eta-spaghetti, fig.width=7, fig.height=4.5}
+set.seed(123)
+n_spaghetti <- 12
+ev_demo <- rxode2::et(seq(0, 100, by = 2)) |> rxode2::et(id = seq_len(n_spaghetti))
+ev_demo$cmt <- "barrier"
+ev_demo_typ <- rxode2::et(seq(0, 100, by = 2)) |> rxode2::et(id = 1L)
+ev_demo_typ$cmt <- "barrier"
+
+sim_demo <- rxode2::rxSolve(mod, events = ev_demo, nSub = n_spaghetti) |> as.data.frame()
+sim_demo_typ <- rxode2::rxSolve(mod_typ, events = ev_demo_typ) |> as.data.frame()
+
+ggplot(sim_demo, aes(x = time, y = EASI, group = id)) +
+  geom_line(colour = "grey60", alpha = 0.6) +
+  geom_line(data = sim_demo_typ, aes(x = time, y = EASI), inherit.aes = FALSE,
+            colour = "black", linewidth = 1.1) +
+  labs(x = "Time (weeks)", y = "EASI",
+       title = "Same THETAs, different ETAs: 12 virtual patients vs. the typical patient",
+       subtitle = "Grey = individual virtual patients (random eta draws); black = typical patient (zeroRe(), eta = 0)",
+       caption = "This same eta-sampling mechanism generates between-subject variability in a population PK model.")
+```
+
+The grey trajectories fan out from (and back toward) the black typical-patient curve purely because of ETA sampling — nothing about the THETAs or the structural ODEs changes between patients. This THETA-fixed / ETA-random pattern is exactly what you will see again when sampling from a population PK model: THETA sets the population-typical PK parameter (e.g. CL, V), OMEGA sets its between-subject variance, and ETA is each simulated subject's individual draw.
+
+> **Exercise 1 (Vpop sampling distribution).** `eta_k1` above is drawn `rnorm(n_demo, mean = 0, sd = sqrt(omega_k1))` -- a log-normal Vpop assumption on `k1`, matching the paper's own between-patient model. Try substituting a different sampling distribution for `eta_k1` (same mean 0, same variance `omega_k1`, e.g. a scaled/shifted Beta, a truncated normal, or a mixture of two normals to represent two latent sub-populations) and re-run the histogram and spaghetti-plot chunks above. Does the shape of the individual-`k1` distribution change qualitatively? Does the EASI spaghetti fan out differently? This is a quick way to build intuition for how much a Vpop's *distributional shape* (not just its mean/variance) matters to a QSP model's simulated heterogeneity, before the same question is revisited for a *correlated* Vpop block next, and for the joint PopPK+QSP roster later in this document.
+
+```{r ex1-answer, echo=show_answers, eval=show_answers, include=show_answers}
+# Suggested answer: an equal-weight two-component mixture of normals with the
+# same overall mean (0) and variance (omega_k1) as the paper's single normal,
+# representing two latent sub-populations (e.g. "fast" and "slow" skin-barrier
+# recoverers) instead of one homogeneous distribution.
+set.seed(123)
+d_mix <- sqrt(omega_k1) * 1.2       # component separation, chosen so the mixture
+                                    # variance still equals omega_k1 (see below)
+component <- rbinom(n_demo, 1, 0.5)
+eta_k1_mix <- ifelse(component == 0,
+                     rnorm(n_demo, mean = -d_mix, sd = sqrt(omega_k1) * 0.5),
+                     rnorm(n_demo, mean =  d_mix, sd = sqrt(omega_k1) * 0.5))
+cat("Mixture mean (should be ~0):", mean(eta_k1_mix), "\n")
+cat("Mixture variance (should be ~omega_k1 =", omega_k1, "):", var(eta_k1_mix), "\n")
+
+k1_indiv_mix <- exp(lk1 + eta_k1_mix)
+df_mix <- rbind(
+  data.frame(quantity = "ETA (log-normal, paper)", value = eta_k1),
+  data.frame(quantity = "ETA (bimodal mixture)", value = eta_k1_mix)
+)
+ggplot(df_mix, aes(x = value)) +
+  geom_histogram(bins = 40, fill = "darkorange", alpha = 0.7, colour = "white") +
+  facet_wrap(~ quantity, nrow = 1) +
+  labs(x = NULL, y = "Count",
+       title = "Same mean and variance, different distributional shape",
+       subtitle = "A bimodal Vpop assumption is invisible to mean/variance alone but visible in the histogram")
+```
+
+With matched mean and variance, the *marginal* individual-`k1` distribution still differs visibly (bimodal vs. unimodal), and re-running the spaghetti plot with `eta_k1_mix` in place of `eta_k1` would fan the EASI trajectories into two visually separated bands rather than one smooth cloud -- illustrating that Vpop shape, not just its first two moments, shapes simulated cohort heterogeneity.
+
+## Correlated Vpop sampling: a Th2-pathway example
+
+Every one of the 51 QSP etas above is drawn **independently** -- `mod()$omega` is a fully diagonal 51x51 matrix, and the paper reports no off-diagonal covariance between any pair of the 51 rate constants. That is a reasonable simplification for a model-based meta-analysis, but it is worth being explicit about what it assumes away: in real biology, several of these rate constants are plausibly **co-regulated**, because they are downstream readouts of the same upstream driver rather than biologically independent processes.
+
+A concrete example lives inside this model's own ODEs. Three of the 51 etas -- `etalk11` (IL-4 production rate), `etalk13` (IL-13 production rate), and `etalk19` (IL-31 production rate) -- each multiply the *same* `th2` compartment in their respective cytokine equations (`d/dt(il4)`, `d/dt(il13)`, `d/dt(il31)` all contain a `k11*th2`, `k13*th2`, `k19*th2` term). IL-4, IL-13, and IL-31 are all classic Th2-cytokines under shared transcriptional control in activated Th2 cells; a patient whose Th2 cells are unusually efficient at producing one of these cytokines is plausibly also more efficient at producing the other two, simply because all three readouts share the same upstream cell population and signalling machinery. The model's diagonal OMEGA cannot express this -- it treats a patient's `etalk11`, `etalk13`, and `etalk19` draws as though they came from three unrelated patients.
+
+This section builds a small correlated Vpop block for exactly these three etas, using their own paper-derived variances (`sigma.csv` rows 28, 31, 40) and an explicit, clearly-labelled illustrative correlation `rho`, and compares the resulting joint sampling behaviour against the model's default independent-draw assumption.
+
+```{r th2-corr-block}
+# Th2-driven cytokine-production ETAs: IL-4 (etalk11), IL-13 (etalk13),
+# IL-31 (etalk19). Variances are the paper's own OMEGA diagonal entries
+# (mod()$omega; sigma.csv rows 28, 31, 40 squared) -- unchanged from the
+# independent-draw assumption. Only the off-diagonal covariance below is new
+# and illustrative (the paper reports none).
+qsp_omega_diag <- diag(mod()$omega)
+th2_names <- c("etalk11", "etalk13", "etalk19")
+th2_vars <- qsp_omega_diag[th2_names]
+th2_vars
+
+rho <- 0.6  # illustrative shared-Th2-pathway correlation; NOT estimated from
+            # data (the paper reports no off-diagonal covariance) -- chosen
+            # only to make the joint-sampling effect visible below.
+corr_mat <- matrix(rho, nrow = 3, ncol = 3)
+diag(corr_mat) <- 1
+th2_sds <- sqrt(th2_vars)
+Sigma_th2 <- diag(th2_sds) %*% corr_mat %*% diag(th2_sds)
+dimnames(Sigma_th2) <- list(th2_names, th2_names)
+Sigma_th2
+```
+
+`Sigma_th2` is a block covariance matrix: its diagonal reproduces the paper's own three variances exactly (so each parameter's *marginal* distribution is unchanged), while its off-diagonal entries introduce the illustrative pairwise correlation `rho`. Drawing from this block with `rmvnorm()` (instead of three independent `rnorm()` calls) is the only change needed to sample a correlated Th2-pathway Vpop:
+
+```{r th2-corr-draw, fig.width=8, fig.height=4}
+set.seed(4040)
+n_th2_demo <- 500
+th2_eta_corr <- rmvnorm(n_th2_demo, mean = c(0, 0, 0), sigma = Sigma_th2)
+colnames(th2_eta_corr) <- th2_names
+
+th2_eta_indep <- data.frame(
+  etalk11 = rnorm(n_th2_demo, 0, th2_sds[["etalk11"]]),
+  etalk13 = rnorm(n_th2_demo, 0, th2_sds[["etalk13"]]),
+  etalk19 = rnorm(n_th2_demo, 0, th2_sds[["etalk19"]])
+)
+
+cat("Correlated draw:  cor(etalk11, etalk13) =", cor(th2_eta_corr[, "etalk11"], th2_eta_corr[, "etalk13"]), "\n")
+cat("Independent draw: cor(etalk11, etalk13) =", cor(th2_eta_indep$etalk11, th2_eta_indep$etalk13), "\n")
+
+df_th2 <- rbind(
+  data.frame(etalk11 = th2_eta_corr[, "etalk11"], etalk13 = th2_eta_corr[, "etalk13"], sampling = "Correlated block (rho = 0.6)"),
+  data.frame(etalk11 = th2_eta_indep$etalk11, etalk13 = th2_eta_indep$etalk13, sampling = "Independent (model default)")
+)
+
+ggplot(df_th2, aes(x = etalk11, y = etalk13)) +
+  geom_point(alpha = 0.4, colour = "steelblue") +
+  facet_wrap(~ sampling) +
+  labs(title = "Same marginal variances, different joint (Th2-pathway) structure",
+       caption = "Correlated block: illustrative rho = 0.6, motivated by shared Th2-driven cytokine production; independent: this model's actual OMEGA.")
+```
+
+Both panels have (approximately) the same per-axis spread -- the marginal variance of `etalk11` and `etalk13` is unchanged -- but only the correlated block produces the diagonal joint cloud a "Th2-skewed vs. Th2-mild" patient population would be expected to show. A model that only reports marginal summary statistics per parameter (mean, variance) would look identical between the two sampling schemes; only a joint analysis reveals the difference.
+
+> **Exercise 2 (Correlated Vpop sampling).** `rho = 0.6` above is an illustrative choice, not an estimated value. (a) Re-run the block above with `rho = 0.9` and `rho = 0.2` -- how does the scatter in the right-hand comparison change? (b) `etalk19` (IL-31) is also part of the correlated block but not plotted above; write the code to check `cor(etalk11, etalk19)` in both the correlated and independent draws to confirm the whole 3-parameter block (not just the pair plotted) behaves as intended. (c) This block was built by hand from a biological argument (shared Th2-pathway control), not fit to data -- what kind of dataset would let you actually *estimate* `rho` instead of asserting it?
+
+```{r ex2-answer, echo=show_answers, eval=show_answers, include=show_answers, fig.width=8, fig.height=4}
+# Suggested answer (a): higher rho tightens the scatter onto the diagonal;
+# lower rho widens it back toward the independent-draw cloud.
+set.seed(4040)
+build_th2_block <- function(rho_val, n = 500) {
+  cm <- matrix(rho_val, 3, 3); diag(cm) <- 1
+  sig <- diag(th2_sds) %*% cm %*% diag(th2_sds)
+  dimnames(sig) <- list(th2_names, th2_names)
+  draw <- MASS::mvrnorm(n, mu = c(0, 0, 0), Sigma = sig)
+  data.frame(etalk11 = draw[, "etalk11"], etalk13 = draw[, "etalk13"], rho = rho_val)
+}
+df_rho_compare <- rbind(build_th2_block(0.2), build_th2_block(0.9))
+ggplot(df_rho_compare, aes(x = etalk11, y = etalk13)) +
+  geom_point(alpha = 0.4, colour = "steelblue") +
+  facet_wrap(~ paste0("rho = ", rho)) +
+  labs(title = "Higher rho -> tighter diagonal scatter; lower rho -> closer to independent")
+
+# Suggested answer (b): check the full block, not just one pair.
+cat("Correlated draw:  cor(etalk11, etalk19) =", cor(th2_eta_corr[, "etalk11"], th2_eta_corr[, "etalk19"]), "\n")
+cat("Independent draw: cor(etalk11, etalk19) =", cor(th2_eta_indep$etalk11, rnorm(n_th2_demo, 0, th2_sds[["etalk19"]])), "\n")
+
+# Suggested answer (c): estimating rho for real would require paired,
+# patient-level measurements of at least two of these three cytokines (e.g.
+# serum or lesional-skin IL-4 and IL-13 levels from the same patients at
+# baseline), from which an empirical Bayes / NONMEM $OMEGA BLOCK estimation
+# could estimate the true (non-diagonal) covariance -- exactly the kind of
+# data the Miyano 2022 MBMA did not have available for these 51 parameters.
+```
+
+
+## Illustrative Dupilumab population PK: linking THETA/OMEGA/ETA across PK and QSP PD
+
+The section above ("How PK was incorporated in the Miyano et al QSP paper") described why this QSP model, as published, uses a constant inhibition fraction in place of PK. As a self-contained illustration of what a *linked* PK/QSP-PD model looks like, this section builds a small one-compartment population-PK (PopPK) submodel for dupilumab, simulates a large virtual cohort's dupilumab concentration-time profiles, converts each patient's own concentration to a time-varying `r_il4`/`r_il13` inhibition fraction (an Emax link), and re-simulates EASI-75 for a larger cohort than used above, so a fixed-inhibition vs. PK-driven comparison is apples-to-apples.
+
+**Provenance note.** The dosing regimen below (600 mg SC loading dose, then 300 mg SC every 2 weeks) is the FDA-labeled adult dupilumab regimen for atopic dermatitis and is treated as a citable fact. The PK model's THETA values (`ka`, `CL`, `V`) and OMEGA (between-patient variability) magnitudes are, by contrast, **illustrative only** -- chosen to produce a physiologically plausible mAb-like absorption/elimination shape (few-day SC absorption half-life, few-week elimination half-life), not fit to any specific published dupilumab population-PK dataset. Treat the resulting concentration values as arbitrary relative units, not mg/L.
+
+```{r pick-pk-model}
+moddir <- paste0(getwd(),"/")
+source(paste0(moddir,"dupilumab_ad_2016_nlmixr2.r"))
+source(paste0(moddir,"dupilumab_ad_phase3_model_m2eta_nlmixr2.r"))
+
+
+#pk_dupi <- rxode2::rxode2(dupilumab_pk)
+pk_dupi <- rxode2::rxode2(dupilumab_ad_model4_m2eta)
+pk_dupi
+
+```
+
+```{r finaldupi-pk}
+
+set.seed(7318)
+n_sub <- 1000
+
+induction_end   <- 112
+maintenance_end <- 364
+sim_end         <- 560
+
+dose_times <- function(start, end, interval) {
+  if (is.na(interval)) return(numeric(0))
+  seq(start, end - 1, by = interval)
+}
+
+regimens <- tribble(
+  ~induction, ~maintenance,
+  "q1w",      "q1w",
+  "q1w",      "q4w",
+  "q1w",      "q8w",
+  "q1w",      "Placebo",
+  "q2w",      "q2w",
+  "q2w",      "q4w",
+  "q2w",      "q8w",
+  "q2w",      "Placebo"
+) |>
+  mutate(
+    regimen = paste0("300 mg ", induction, " SC/",
+                   if_else(maintenance == "Placebo", "Placebo",
+                           paste0("300 mg ", maintenance, " SC"))),
+    regimen = fct_inorder(regimen)
+  )
+
+interval_days <- c(q1w = 7, q2w = 14, q4w = 28, q8w = 56, Placebo = NA)
+
+make_events <- function(induction, maintenance) {
+  maint_doses <- dose_times(induction_end, maintenance_end,
+                            interval_days[[maintenance]])
+  ind_doses <- dose_times(interval_days[[induction]], induction_end,
+                          interval_days[[induction]])
+  doses <- tibble(
+    time = c(0, ind_doses, maint_doses),
+    amt  = c(600, rep(300, length(ind_doses) + length(maint_doses)))
+  )
+  obs_times <- seq(0, sim_end, by = 1)
+
+  bind_rows(
+    doses |> mutate(evid = 1, cmt = "depot"),
+    tibble(time = obs_times, amt = 0, evid = 0, cmt = "central")
+  ) |>
+    arrange(time, desc(evid))
+}
+
+# Virtual phase 3 AD population matching the popPK phase 3 dataset (N = 897).
+# Source: FDA Clinical Pharmacology Review, BLA 761055 (2017), Tables 4.6.1
+# and 4.6.3 (from the Applicant's popPK report, Tables 5 and 9):
+#
+#   Covariate  Mean  SD    Min   P5    Q1    Median  Q3    P95   Max
+#   WT (kg)    75.7  18.6  41.0  50.5  62.3  73.0    85.0  109   175
+#   BMI        26.0  5.65  16.3  19.2  22.0  24.9    28.4  37.0  57.3
+#   ALB (g/L)  44.6  3.69  22.0  39.0  42.0  45.0    47.0  50.0  57.0
+#   EASI       32.1  12.9  0.6   16.8  21.3  29.3    40.9  56.4  72.0
+#   White: 615/897 (68.6%)
+#
+# Distributional choices (assumptions):
+#   - WT and BMI: bivariate log-normal fitted to median/IQR; the WT-BMI
+#     correlation is not reported and is assumed to be 0.85.
+#   - ALB: normal(44.6, 3.69), truncated at the observed range.
+#   - EASI: shifted gamma above the entry cutoff of 16 matching mean/SD.
+cov_ranges <- list(WT = c(41, 175), BMI = c(16.3, 57.3), ALB = c(22, 57),
+                   EASI = c(16, 72))
+wt_mu   <- log(73.0); wt_sd  <- log(85.0 / 62.3) / 1.349
+bmi_mu  <- log(24.9); bmi_sd <- log(28.4 / 22.0) / 1.349
+wt_bmi_rho <- 0.85
+easi_excess_mean <- 32.1 - 16
+easi_shape <- (easi_excess_mean / 12.9)^2
+p_white <- 615 / 897
+
+clamp <- function(x, r) pmin(pmax(x, r[1]), r[2])
+
+sample_covariates <- function(n) {
+  z1 <- rnorm(n)
+  z2 <- wt_bmi_rho * z1 + sqrt(1 - wt_bmi_rho^2) * rnorm(n)
+  tibble(
+    id    = seq_len(n),
+    WT    = clamp(exp(wt_mu + wt_sd * z1), cov_ranges$WT),
+    BMI   = clamp(exp(bmi_mu + bmi_sd * z2), cov_ranges$BMI),
+    ALB   = clamp(rnorm(n, 44.6, 3.69), cov_ranges$ALB),
+    EASI  = clamp(16 + rgamma(n, easi_shape, easi_shape / easi_excess_mean),
+                  cov_ranges$EASI),
+    WHITE = rbinom(n, 1, p_white)
+  )
+}
+
+covset <- sample_covariates(n_sub)
+
+# Same virtual patients (covariates and etas) across all regimens
+sim_one <- function(induction, maintenance, regimen) {
+  ev <- make_events(induction, maintenance) |>
+    cross_join(covset) |>
+    arrange(id, time, desc(evid))
+  set.seed(2961)
+  rxode2::rxSolve(pk_dupi, ev, returnType = "tibble") |>
+    select(id, time, cp) |>
+    mutate(regimen = regimen)
+}
+
+sims <- pmap(select(regimens, induction, maintenance, regimen), sim_one) |>
+  list_rbind()
+
+# Predicted concentrations without residual error (ipredSim) for troughs
+pk_sim <- sims |> mutate(conc = cp) |>
+  left_join(covset,by="id")
+# used later in file and breaks if not present
+t_grid <- seq(0, 24, by = 0.5) # finer than the 1-week grid above, to resolve the early PK-driven onset ramp
+
+```
+
+
+This mirrors exactly the THETA/OMEGA/ETA pattern used throughout this vignette for the QSP-mechanism parameters above: `lka`/`lcl`/`lv` are population-typical log-scale THETAs, `etaka`/`etacl`/`etav` are the between-patient random effects, and each simulated patient's own `ka`, `cl`, `v` triple is `exp(THETA + ETA)`, exactly as `k1 <- exp(lk1 + etalk1)` was for the QSP skin-barrier recovery rate.
+
+
+
+Across the `r n_sub`-patient cohort, simulated concentration ranges from `r round(min(pk_sim$conc), 1)` to `r round(max(pk_sim$conc), 1)` (arbitrary relative units) over the 24-week window, rising sharply during the first dosing interval and then oscillating around an accumulated multiple-dose plateau.
+
+### Simulated PK profile (median + prediction interval "VPC-style" band)
+
+A visual predictive check (VPC) normally overlays observed-data percentiles on top of a simulated prediction interval to check that a fitted population-PK model reproduces the observed concentration distribution. No observed dupilumab concentration dataset is attached to this repository, so the plot below is a **simulation-only** population time-course: at each simulated time point across the `r n_per_arm`-patient cohort, it summarises the median and the 5th-95th percentile interval of simulated concentration, in the same spirit as a VPC's simulated-percentile band, but with nothing observed to compare it against. Treat it as a check that the illustrative THETA/OMEGA magnitudes above produce a plausible population profile shape (fast multi-dose accumulation, then a plateau), not as a fit diagnostic.
+
+```{r pk-dupi-vpc, fig.width=8, fig.height=5}
+pk_vpc_summary <- pk_sim |>
+  dplyr::group_by(time,regimen) |>
+  dplyr::summarise(
+    p05    = quantile(conc, 0.05, na.rm = TRUE),
+    median = quantile(conc, 0.50, na.rm = TRUE),
+    p95    = quantile(conc, 0.95, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(pk_vpc_summary, aes(x = time,fill=regimen)) +
+  geom_ribbon(aes(ymin = p05, ymax = p95), fill = "steelblue", alpha = 0.25) +
+  geom_line(aes(y = median), colour = "steelblue4", linewidth = 1) +
+  theme_bw() +
+  labs(x = "Time (Days)", y = "Simulated dupilumab concentration (arbitrary relative units)",
+       title = paste0("Illustrative dupilumab population PK: simulated concentration-time profile (n = ", n_sub, ")"),
+       subtitle = "Median (line) and 5th-95th percentile interval (ribbon) across the simulated virtual cohort",
+       caption = "Simulation-only band -- no observed concentration data overlaid (illustrative THETA/OMEGA, see provenance note above); not a fit-validating VPC.")+
+        facet_wrap(~regimen)
+```
+
+The ribbon widens visibly around each dosing event before narrowing again as the cohort's absorption-phase concentrations converge toward the next trough, which is the expected between-patient spread from the `etaka`/`etacl`/`etav` OMEGAs layered on top of the deterministic multi-dose accumulation pattern.
+
+Concentration is converted to a time-varying inhibition fraction with a simple Emax model:
+
+$$ r_{il4}(t) = r_{il13}(t) = E_{max} \cdot \frac{C(t)}{EC_{50} + C(t)}$$
+
+```{r pk-emax-link}
+Emax <- 0.99  # matches this model's existing antibody-inhibition ceiling (r_il4 = r_il13 = 0.99 above)
+EC50 <- 15    # illustrative; arbitrary relative units matching `conc` above; not fit to target-engagement data
+
+pk_cov <- pk_sim |>
+  dplyr::transmute(id, time,
+                   r_il4  = Emax * conc / (EC50 + conc),
+                   r_il13 = Emax * conc / (EC50 + conc))
+```
+
+`Emax = 0.99` is chosen to exactly match this model's existing antibody-inhibition ceiling (the same 0.99 used for the fixed-inhibition Dupilumab arm above), so any difference between the two mechanisms reflects only the time-course, not a different maximum effect. `EC50 = 25` (same arbitrary relative units as `conc`) is an illustrative choice -- not fit to any target-engagement dataset -- picked from this cohort's simulated concentration range so that the inhibition fraction visibly ramps up over the first 1-2 weeks of absorption before plateauing near the 0.99 ceiling, which is the qualitative onset-delay behaviour a real PK/PD link is expected to show.
+
+The two mechanisms -- this model's constant fixed inhibition vs. the time-varying PK-driven inhibition just built -- are compared directly in Exercise 3 below, once the joint virtual-patient roster gives both mechanisms the *same* virtual patients' QSP etas (a fair comparison needs that; simulating each mechanism with its own independent random draw, as an earlier version of this comparison did, only tells you the two cohorts differ, not why).
+
+Assumptions specific to this illustrative PK section:
+
+- All PK THETA/OMEGA values (`lka`, `lcl`, `lv` and their etas) are illustrative mAb-like magnitudes, not fitted to a specific published dupilumab population-PK dataset -- only the labeled dosing regimen (600 mg SC load, 300 mg SC q2w) is a citable fact.
+- `conc` is reported in arbitrary relative units (`central`/`V` with an arbitrary `V`), not mg/L; `EC50 = 25` is chosen in those same units purely to produce a visible ~1-2 week onset ramp, not fit to a target-engagement/receptor-occupancy dataset.
+- The PK ETAs (`etaka`, `etacl`, `etav`) and the 51 QSP-mechanism ETAs are drawn independently -- no correlation between the two is assumed or estimated, since no published joint PK/QSP-severity distribution exists for this model. This is a different independence assumption than the intra-QSP one relaxed in "Correlated Vpop sampling" above (that exercise built correlation *within* the 51 QSP etas; the PK-QSP cross-model correlation considered here remains an open question -- see the closing discussion exercise).
+- Only `r_il4` and `r_il13` are made time-varying here (dupilumab's two cytokine targets); the remaining six drug-effect parameters are held at their Dupilumab constant values (0 for all, per `drug_params` above).
+
+### Kovalenko structural check
+
+**Exercise 4.** The PK submodel built above (`pk_dupi_fn`) is a one-compartment model with linear (first-order) elimination: `d/dt(central) <- ka*depot - (cl/v)*central`. Kovalenko 2016 (cited in the Introduction) reports a structurally different population-PK model for real dupilumab data: a **2-compartment** model with **parallel linear and Michaelis-Menten (nonlinear, target-mediated) elimination** -- i.e. an extra peripheral compartment plus an elimination term of the form `(cl/v)*central + (vmax*central/v)/(km + central/v)`, on top of the depot/central structure above. This is a structural fact about the published model; the exact NONMEM parameter estimates (CL, V, Vmax, Km, Q, Vp) were not independently retrievable from the sources available in this environment (the paper is paywalled and both PubMed and the publisher blocked automated access), so this exercise is a **structural**, not numerical, comparison.
+
+Work through, in order:
+
+(a) A 2-compartment model adds a peripheral (tissue) compartment exchanging drug with `central` at rate `Q`. Structurally, what does this add to the shape of a concentration-time curve that a 1-compartment model cannot produce (think about what happens right after the loading dose, before the first maintenance dose)?
+
+(b) Parallel linear + Michaelis-Menten elimination means the *fraction* of drug cleared by the nonlinear (saturable, target-mediated) pathway is largest when concentration is low relative to `Km`, and negligible when concentration is high relative to `Km`. Given the multi-dose accumulation profile from `pk_dupi_vpc` above, at what point(s) in the dosing interval (peak vs. trough) would this nonlinear pathway matter most, and would you expect it to matter more early in treatment or after several maintenance doses have accumulated?
+
+(c) Sketch the `ini()`/`model()` block you would write to add a peripheral compartment and Michaelis-Menten elimination to `pk_dupi_fn` (you do not need real parameter values -- just the structural syntax: what compartments, what rate constants, what functional form for the elimination term).
+
+
+## Building a joint virtual-patient roster: linking PopPK and QSP Vpop sampling
+
+The PK and QSP cohorts simulated above are each internally consistent (`id` uniquely labels one virtual patient's PK draw, or one virtual patient's QSP draw), but the *two* cohorts were never linked, as the assumptions bullet above makes explicit. Any exercise that wants to ask "what dose-response curve does patient 5 show, given both their own absorption/clearance and their own skin-barrier/cytokine kinetics?" needs a **joint roster**: one set of virtual patients whose PK parameters and QSP parameters are drawn once, stored, and then reused unchanged across every subsequent simulation, regardless of dosing regimen.
+
+**Why re-solving with a shared seed is not enough.** A tempting shortcut is to call `set.seed(3030)` immediately before *both* the PK and QSP `rxSolve()` calls, hoping this "links" patient `id` 5's PK draw to their QSP draw. This does make the roster reproducible (re-running the script always gives the same pairing), but it does **not** create any statistical correlation between a patient's PK parameters and their QSP parameters -- each simulation still draws independently from its own OMEGA, consuming a different count of random numbers from the seeded stream (3 PK etas vs. 51 QSP etas). A genuinely correlated joint model would require an estimated shared or dependent random-effect structure, which does not exist for this QSP model. What an explicit-draw approach *does* give you is a well-defined, inspectable, reproducible roster -- the actual prerequisite for the dose-response exercise below.
+
+**Overriding calculated parameters directly does not work.** It might seem natural to solve once, read off each patient's realized `ka`/`cl`/`v` (or `k1`, `k2`, ...) from the output columns, and then supply those values directly as covariates in later simulations. This fails silently: `ka`, `cl`, `v` (and `k1`, `k2`, ...) are assigned inside `model()` from THETA + ETA (e.g. `ka <- exp(lka + etaka)`), so rxode2 recalculates them at solve time regardless of what a same-named data column supplies -- a data column only overrides a parameter that the model does *not* itself compute (this is why the `r_il4`/`r_il13` covariate trick earlier in this vignette works: those are plain `ini()` THETAs, never recalculated inside `model()`). The fix is to override the ETAs themselves (`etaka`, `etacl`, `etav`, `etalk1`, ...) as covariates -- since those are never recalculated, whatever value is supplied for a given `id` at every row is exactly what feeds into the model's own `ka <- exp(lka + etaka)` calculation, giving deterministic and reproducible per-patient parameters at any dose or time grid.
+
+```{r vpop-roster-build}
+set.seed(3030)
+n_roster <- n_sub  # reuse the existing 200-patient PK cohort size
+
+# Draw each patient's PK-level ETAs from pk_dupi's own OMEGA (no re-typed
+# magic numbers -- single source of truth is the fitted model object).
+pk_eta_names <- rownames(pk_dupi$omega)
+pk_eta_list <- lapply(pk_eta_names, function(nm)
+  rnorm(n_roster, mean = 0, sd = sqrt(pk_dupi$omega[nm, nm])))
+names(pk_eta_list) <- pk_eta_names
+pk_eta_df <- as.data.frame(pk_eta_list)
+pk_eta_df$id <- seq_len(n_roster)
+
+# Draw the Th2-pathway block (etalk11, etalk13, etalk19) from the correlated
+# Sigma_th2 covariance built in "Correlated Vpop sampling" above -- this is
+# the only departure from a fully independent 51-parameter QSP draw.
+th2_eta_roster <- rmvnorm(n_roster, mean = c(0, 0, 0), sigma = Sigma_th2)
+colnames(th2_eta_roster) <- th2_names
+th2_eta_df <- as.data.frame(th2_eta_roster)
+th2_eta_df$id <- seq_len(n_roster)
+
+# Draw the remaining 48 QSP-mechanism ETAs independently from mod()'s own
+# OMEGA diagonal, exactly as the model itself assumes.
+qsp_omega_diag <- diag(mod()$omega)
+qsp_other_names <- setdiff(names(qsp_omega_diag), th2_names)
+qsp_eta_list <- lapply(qsp_other_names, function(nm)
+  rnorm(n_roster, mean = 0, sd = sqrt(qsp_omega_diag[[nm]])))
+names(qsp_eta_list) <- qsp_other_names
+qsp_eta_df <- as.data.frame(qsp_eta_list)
+qsp_eta_df$id <- seq_len(n_roster)
+
+vpop_roster <- pk_eta_df |>
+  dplyr::left_join(th2_eta_df, by = "id") |>
+  dplyr::left_join(qsp_eta_df, by = "id") |>
+  dplyr::left_join(covset,by="id")|>
+  dplyr::relocate(id)
+head(vpop_roster)
+dim(vpop_roster)
+```
+
+`vpop_roster` has one row per virtual patient and `r ncol(vpop_roster) - 1` ETA columns (3 PK + 51 QSP, of which 3 -- the Th2 block -- are drawn jointly/correlated and 48 remain independent). Because these are the raw ETAs (not the derived `ka`/`cl`/`v`/`k1`/...), the same roster can be merged into any future events dataframe by `id` -- for any dosing regimen or time grid -- and will always reconstruct the identical per-patient parameters. Two checks confirm the intended structure: no correlation between PK and QSP etas (as expected, since none is assumed), and the intended correlation within the Th2 block (as built above):
+
+```{r vpop-roster-check, fig.width=11, fig.height=4.5}
+cat("cor(etacl, etalk1)   [PK vs. unrelated QSP eta, expect ~0]:  ", cor(vpop_roster$eta.ke, vpop_roster$etalk1), "\n")
+cat("cor(etalk11, etalk13) [Th2 block, expect ~", rho, "]:          ", cor(vpop_roster$etalk11, vpop_roster$etalk13), "\n")
+cat("cor(etalk11, etalk19) [Th2 block, expect ~", rho, "]:          ", cor(vpop_roster$etalk11, vpop_roster$etalk19), "\n")
+
+df_check <- rbind(
+  data.frame(x = vpop_roster$eta.ke, y = vpop_roster$etalk1,
+             panel = "PK etacl vs. QSP etalk1 (independent)"),
+  data.frame(x = vpop_roster$etalk11, y = vpop_roster$etalk13,
+             panel = "QSP etalk11 vs. etalk13 (correlated Th2 block)")
+)
+ggplot(df_check, aes(x = x, y = y)) +
+  geom_point(alpha = 0.4) +
+  facet_wrap(~ panel, scales = "free") +
+  labs(x = NULL, y = NULL,
+       title = "vpop_roster structure check: independent by default, correlated where explicitly built")
+```
+
+
+This `vpop_roster` is the joint sampling infrastructure used in the dose-response exercise below.
+
+## Dose-response exercise: from Miyano's rudimentary link to an integrated PopPK + QSP model
+
+Miyano 2022, as published, has no dose axis at all -- each drug arm is a fixed inhibition fraction, not a function of mg administered. This section builds a genuine dose-response curve three ways, using the `vpop_roster` joint sampling from above so that each virtual patient's identity (both PK and QSP parameters) is held fixed across every dose level.
+
+### (a) Miyano-style rudimentary dose-response (no PK, no dose)
+
+As a baseline, the closest thing to a "dose-response" the published model supports is sweeping the inhibition fraction itself as a synthetic dose proxy (there being no real dose to sweep):
+
+```{r doseresponse-a, fig.width=7, fig.height=4.5}
+inhibition_levels <- c(0, 0.25, 0.5, 0.75, 0.99)
+
+dose_response_a <- purrr::map_dfr(inhibition_levels, function(r_val) {
+  ev <- rxode2::et(seq(0, 24, by = 1)) |> rxode2::et(id = seq_len(n_per_arm))
+  ev$cmt <- "barrier"
+  p <- c(r_placebo = 1, r_il4 = r_val, r_il13 = r_val, r_il17 = 0, r_il22 = 0,
+         r_il31 = 0, r_tslp = 0, r_ox40l = 0, c_rifng = 0, e_a2 = 1)
+  sim <- rxode2::rxSolve(mod_stoch, events = ev, nSub = n_per_arm, params = p,
+                         inits = baseline_typ_named) |> as.data.frame()
+  sim$inhibition <- r_val
+  sim
+})
+
+baseline_a <- dose_response_a |> dplyr::filter(time == 0) |>
+  dplyr::select(inhibition, id, EASI_baseline = EASI)
+dose_response_a <- dose_response_a |>
+  dplyr::left_join(baseline_a, by = c("inhibition", "id")) |>
+  dplyr::mutate(pct_improved = 100 * (EASI_baseline - EASI) / EASI_baseline)
+
+easi75_a <- dose_response_a |>
+  dplyr::filter(time == 24) |>
+  dplyr::group_by(inhibition) |>
+  dplyr::summarise(EASI75 = 100 * mean(pct_improved > 75, na.rm = TRUE), .groups = "drop")
+
+ggplot(easi75_a, aes(x = inhibition, y = EASI75)) +
+  geom_point(size = 3) + geom_line() +
+  labs(x = "Fixed cytokine-inhibition fraction (r_il4 = r_il13; a synthetic \"dose\" proxy)",
+       y = "Week-24 EASI-75 responder rate (%)",
+       title = "(a) Miyano-style rudimentary dose-response",
+       caption = paste0("n = ", n_per_arm, " per level; no real dose or PK axis exists in the published model."))
+```
+
+This curve answers a different question than a true dose-response: it shows how EASI-75 depends on an *assumed* inhibition fraction, not on how much drug (mg) was administered or how that translates to target engagement over time.
+
+### (b) Integrated PopPK + QSP dose-response
+
+Using `vpop_roster`, the same `r n_roster` virtual patients are dosed at five maintenance-dose levels (600 mg load + q2w maintenance, the labeled regimen's structure, scaled to different maintenance amounts): each patient's own fixed PK ETAs generate a real concentration-time profile, the Emax link converts that profile to a time-varying `r_il4`/`r_il13`, and each patient's own fixed QSP ETAs generate their EASI trajectory.
+
+Each point on this curve is a responder-rate estimate from one finite virtual cohort (`n_roster` = `r n_roster` patients), so it carries sampling uncertainty just like an observed rate from a real trial would. Because the per-patient outcomes are already fully simulated below, a **nonparametric (case-resampling) bootstrap** is the cheapest way to quantify that uncertainty: resample the `n_roster` patients' already-simulated `pct_improved` outcomes with replacement, recompute the EASI-75 proportion, repeat many times, and take the 2.5th/97.5th percentiles of the resulting distribution. This needs no new ODE solves -- only resampling numbers already in hand -- unlike a *parametric* bootstrap that would redraw fresh ETAs and re-run `rxSolve()` for every replicate.
+
+
+
+```{r doseresponse-b, fig.width=8, fig.height=5}
+dose_levels <- c(100, 200, 300, 450, 600)  # maintenance SC dose (mg), q2w; loading = 2x maintenance (same structure as the labeled regimen above)
+n_doses_maintenance <- 25
+
+
+
+sample_times <- seq(0, 14 * (n_doses_maintenance + 1) + 14, by = .5)
+simulate_dose <- function(maintenance_dose) {
+  # PK: same cohort size. etaka/etacl/etav covariates from vpop_roster (see technique note above).
+  ev_pk_dose <- rxode2::et(amt = 2 * maintenance_dose, time = 0, cmt = "depot", id = seq_len(n_roster)) |>
+    rxode2::et(amt = maintenance_dose, time = 2, ii = 2, addl = 11, cmt = "depot") |>
+    rxode2::et(t_grid)
+  ev_pk_dose <- as.data.frame(ev_pk_dose) |>
+    dplyr::left_join(vpop_roster |> dplyr::select(id, all_of(pk_eta_names),WT:WHITE), by = "id") 
+  pk_dose_sim <- rxode2::rxSolve(pk_dupi, events = ev_pk_dose) |> 
+    mutate(conc=cp) |>
+    as.data.frame()
+
+  pk_dose_cov <- pk_dose_sim |>
+    dplyr::transmute(id, time,
+                     r_il4  = Emax * conc / (EC50 + conc),
+                     r_il13 = Emax * conc / (EC50 + conc))
+
+  # QSP: same t_grid/cohort, QSP ETAs pinned per patient via vpop_roster,
+  # PK-derived time-varying r_il4/r_il13 covariate merged in alongside them.
+  ev_qsp_dose <- rxode2::et(t_grid) |> rxode2::et(id = seq_len(n_roster))
+  ev_qsp_dose$cmt <- "barrier"
+  ev_qsp_dose <- as.data.frame(ev_qsp_dose) |>
+    dplyr::left_join(pk_dose_cov, by = c("id", "time")) |>
+    dplyr::left_join(vpop_roster |> dplyr::select(id, dplyr::all_of(names(qsp_omega_diag))), by = "id")
+
+  p_dose_other <- c(r_placebo = 1, r_il17 = 0, r_il22 = 0, r_il31 = 0,
+                    r_tslp = 0, r_ox40l = 0, c_rifng = 0, e_a2 = 1)
+
+  qsp_dose_sim <- rxode2::rxSolve(mod_stoch, events = ev_qsp_dose,
+                                  params = p_dose_other,
+                                  inits = baseline_typ_named) |> as.data.frame()
+  qsp_dose_sim$dose <- maintenance_dose
+  qsp_dose_sim
+}
+
+dose_response_b <- purrr::map_dfr(dose_levels, simulate_dose)
+
+baseline_b <- dose_response_b |> dplyr::filter(time == 0) |>
+  dplyr::select(dose, id, EASI_baseline = EASI)
+dose_response_b <- dose_response_b |>
+  dplyr::left_join(baseline_b, by = c("dose", "id")) |>
+  dplyr::mutate(pct_improved = 100 * (EASI_baseline - EASI) / EASI_baseline)
+
+# Nonparametric (case-resampling) bootstrap 95% CI on the week-24 EASI-75
+# responder rate at each dose: resample the n_roster patients' already-
+# simulated pct_improved outcomes with replacement, recompute the responder
+# proportion, repeat n_boot times, and take percentiles. This captures
+# sampling uncertainty from having a finite virtual cohort; it does NOT
+# capture parameter uncertainty in the model's own THETA/OMEGA estimates
+# (see the interpretation note below).
+set.seed(9090)
+n_boot <- 500L
+
+boot_easi75 <- function(pct_improved, n_boot) {
+  n <- length(pct_improved)
+  point_est <- 100 * mean(pct_improved > 75, na.rm = TRUE)
+  boot_props <- replicate(n_boot, {
+    100 * mean(sample(pct_improved, n, replace = TRUE) > 75, na.rm = TRUE)
+  })
+  tibble::tibble(EASI75 = point_est,
+                lower = unname(quantile(boot_props, 0.025)),
+                upper = unname(quantile(boot_props, 0.975)))
+}
+
+easi75_b <- dose_response_b |>
+  dplyr::filter(time == 24) |>
+  dplyr::group_by(dose) |>
+  dplyr::group_modify(~ boot_easi75(.x$pct_improved, n_boot)) |>
+  dplyr::ungroup()
+
+ggplot(easi75_b, aes(x = dose, y = EASI75)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, fill = "steelblue") +
+  geom_point(size = 3) + geom_line() +
+  labs(x = "Maintenance dose (mg SC, q2w; loading = 2x)",
+       y = "Week-24 EASI-75 responder rate (%)",
+       title = "(b) Integrated PopPK + QSP dose-response, with bootstrap 95% CI",
+       caption = paste0("Point = observed responder rate across n = ", n_roster,
+                        " virtual patients (vpop_roster, reused across every dose level); ",
+                        "ribbon = nonparametric bootstrap 95% CI (", n_boot, " resamples)."))
+```
+
+Unlike (a), this curve is a genuine dose-response: the x-axis is an actual administered mg dose, and the EASI-75 rate at each dose reflects the same `r n_roster` virtual patients' own absorption/clearance and skin/cytokine kinetics propagating through a real concentration profile and Emax link -- lower doses show a visibly lower plateau concentration (per the `pk_dupi_fn` PK submodel) and correspondingly lower EASI-75, while doses at or above the labeled 300 mg maintenance level approach the same saturating response seen in the fixed-inhibition mechanism above.
+
+> **Interpreting the ribbon:** the bootstrap band only reflects finite-cohort sampling uncertainty in the responder-*rate estimate* -- it answers "how much would this curve wiggle if I re-drew a different random sample of `n_roster` patients from the same simulated distribution?" It does **not** propagate uncertainty in the underlying model itself (e.g. the paper's fitted THETA/OMEGA values, or the illustrative PK submodel's parameters). Quantifying that structural/parameter uncertainty would require a *parametric* bootstrap or a full uncertainty analysis on the original model fits, which is out of scope for this tutorial.
+
+### (c) Exercise 3: fixed inhibition vs. PK-driven inhibition at a matched dose
+
+`dose_response_b` already contains the PK-driven mechanism's result at the labeled 300 mg maintenance dose (the `dose == 300` rows). Build the matching **fixed-inhibition** comparator -- the same `vpop_roster` virtual patients (same QSP etas), same `t_grid`, but with `r_il4 = r_il13 = 0.99` held constant for the whole 24 weeks instead of the PK-driven time-varying value -- and compare the two EASI-75 curves. Because both mechanisms now reuse the *same* `vpop_roster` QSP etas, any difference you see is attributable only to the drug-effect mechanism, not to different patients.
+
+```{r ex3-answer, echo=show_answers, eval=show_answers, include=show_answers, fig.width=8, fig.height=5}
+# Suggested answer: fixed-inhibition comparator using the SAME vpop_roster
+# QSP etas as dose_response_b (dose == 300), so the two mechanisms are
+# compared on identical virtual patients.
+ev_fixed_matched <- rxode2::et(t_grid) |> rxode2::et(id = seq_len(n_roster))
+ev_fixed_matched$cmt <- "barrier"
+ev_fixed_matched <- as.data.frame(ev_fixed_matched) |>
+  dplyr::left_join(vpop_roster |> dplyr::select(id, dplyr::all_of(names(qsp_omega_diag))), by = "id")
+p_fixed_matched <- c(r_placebo = 1, r_il4 = 0.99, r_il13 = 0.99, r_il17 = 0, r_il22 = 0,
+                     r_il31 = 0, r_tslp = 0, r_ox40l = 0, c_rifng = 0, e_a2 = 1)
+fixed_matched_sim <- rxode2::rxSolve(mod_stoch, events = ev_fixed_matched,
+                                     params = p_fixed_matched,
+                                     inits = baseline_typ_named) |> as.data.frame()
+
+easi75_from_matched <- function(sim, label) {
+  baseline_easi <- sim |> dplyr::filter(time == 0) |> dplyr::select(id, EASI_baseline0 = EASI)
+  sim |>
+    dplyr::select(-dplyr::any_of("EASI_baseline"), -dplyr::any_of("pct_improved")) |>
+    dplyr::left_join(baseline_easi, by = "id") |>
+    dplyr::mutate(pct_improved = 100 * (EASI_baseline0 - EASI) / EASI_baseline0) |>
+    dplyr::group_by(time) |>
+    dplyr::summarise(EASI75 = 100 * mean(pct_improved > 75, na.rm = TRUE), .groups = "drop") |>
+    dplyr::mutate(mechanism = label)
+}
+
+easi75_matched_compare <- dplyr::bind_rows(
+  dose_response_b |> dplyr::filter(dose == 300) |>
+    easi75_from_matched("PK-driven (300 mg q2w)"),
+  easi75_from_matched(fixed_matched_sim, "Fixed inhibition (r_il4 = r_il13 = 0.99)")
+)
+
+p <- ggplot(easi75_matched_compare, aes(x = time, y = EASI75, colour = mechanism)) +
+  geom_line(linewidth = 0.9) +
+  theme_bw()+
+  theme(legend.position="bottom")+
+  labs(x = "Time on treatment (weeks)", y = "EASI-75 responder rate (%)",
+       colour = NULL,
+       title = "Fixed inhibition vs. PK-driven inhibition, same virtual patients, matched 300 mg dose",
+       caption = "Both mechanisms reuse vpop_roster's QSP etas -- only the drug-effect mechanism differs.")
+p
+ggsave("PK-vs-fixed-inhibition-projections.pdf",plot=p)
+
+get_val_m <- function(df, wk, mech) round(df$EASI75[df$time == wk & df$mechanism == mech], 0)
+cat("Week 2  -- PK-driven:", get_val_m(easi75_matched_compare, 2, "PK-driven (300 mg q2w)"),
+    "%  Fixed:", get_val_m(easi75_matched_compare, 2, "Fixed inhibition (r_il4 = r_il13 = 0.99)"), "%\n")
+cat("Week 24 -- PK-driven:", get_val_m(easi75_matched_compare, 24, "PK-driven (300 mg q2w)"),
+    "%  Fixed:", get_val_m(easi75_matched_compare, 24, "Fixed inhibition (r_il4 = r_il13 = 0.99)"), "%\n")
+```
+
+The PK-driven mechanism lags behind the fixed-inhibition mechanism early in treatment (the inhibition fraction is still ramping up through the SC absorption phase, while the fixed mechanism is unrealistically already at full 0.99 blockade from t = 0), and does not fully converge to the fixed mechanism's ceiling by week 24 (the accumulated multi-dose concentration plateaus a little below full saturation of the Emax relationship). The qualitative lesson generalizes beyond dupilumab: treating drug effect as an instantaneous constant systematically overstates early-treatment response relative to a model that links a real absorption/distribution/elimination profile to target engagement.
+
+### (d) Exercise 5: open-ended integration questions
+
+The `vpop_roster` approach above links PopPK and QSP sampling by drawing and pinning each patient's ETAs once, then re-simulating both models independently at every dose level. This is one of several possible designs. Consider and discuss:
+
+- Exercise 2 built a correlated Vpop block *within* the 51 QSP etas (the Th2-pathway triplet). Suppose you instead wanted to correlate a PK eta with a QSP eta -- e.g., patients with faster drug clearance also having more severe baseline QSP-mechanism kinetics. What kind of data would you need to justify and estimate that specific cross-model correlation, and how would you extend the block-covariance technique from Exercise 2 to a joint PK+QSP block in `vpop_roster`?
+- This exercise re-solves the full 24-week QSP trajectory independently for every dose level (5 dose levels x `r n_roster` patients x `r length(t_grid)` time points). For a larger dose grid or an optimization loop, what would you change about the simulation strategy to avoid quadratic blow-up in runtime?
+- The Emax link (`Emax`, `EC50`) is illustrative and shared with the fixed-inhibition ceiling above. If you had real target-engagement (receptor occupancy) data for dupilumab, how would you re-parameterize this link, and what would change in the resulting dose-response shape?
+- Exercise 4 sketched a structurally faithful (2-compartment, parallel linear + Michaelis-Menten) PK model for dupilumab. At what dose range would you expect that structural simplification (using the simpler 1-compartment linear model instead) to matter most for the dose-response curve in (b), and why?
+
+No code is provided for this part -- it is meant to be worked through as a discussion or a follow-on modeling exercise.
+
