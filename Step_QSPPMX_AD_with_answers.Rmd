@@ -380,14 +380,25 @@ The 600 mg SC loading dose followed by 300 mg SC every two weeks is the labeled 
 ### Build the model and dosing scenarios
 
 ```{r pick-pk-model}
+
+grep("cloud",getwd())
+if(length(grep("cloud",getwd()))>0){
+moddir_positcloud <- paste(getwd(),"QSP-AD-streamlined/",sep="/")
+source(paste0(moddir_positcloud,"dupilumab_ad_2016_nlmixr2.r"))
+source(paste0(moddir_positcloud,"dupilumab_ad_phase3_model_m2eta_nlmixr2.r"))
+}else{
 moddir <- paste0(getwd(),"/")
 source(paste0(moddir,"dupilumab_ad_2016_nlmixr2.r"))
 source(paste0(moddir,"dupilumab_ad_phase3_model_m2eta_nlmixr2.r"))
+}
 
+#source("dupilumab_ad_2016_nlmixr2.r")
+#source("dupilumab_ad_phase3_model_m2eta_nlmixr2.r")
 
 #pk_dupi <- rxode2::rxode2(dupilumab_pk)
 pk_dupi <- rxode2::rxode2(dupilumab_ad_model4_m2eta)
 pk_dupi
+
 
 ```
 
@@ -815,7 +826,7 @@ The PopPK and PopSP cohorts simulated above are each internally consistent (`id`
 
 **A shared seed is not a joint model.** Reproducible random draws do not identify a biological correlation between PK and QSP parameters. Here, four PK ETAs and 51 QSP ETAs are drawn into separate blocks and stored on the same patient `id`. A cross-model covariance would need paired data and an estimated joint random-effect structure. The explicit roster makes the chosen independence assumption inspectable and keeps each patient's draws fixed across doses.
 
-**Overriding calculated parameters directly does not work.** It might seem natural to solve once, read off each patient's realized `ka`/`cl`/`v` (or `k1`, `k2`, ...) from the output columns, and then supply those values directly as covariates in later simulations. This fails silently: `ka`, `cl`, `v` (and `k1`, `k2`, ...) are assigned inside `model()` from THETA + ETA (e.g. `ka <- exp(lka + etaka)`), so rxode2 recalculates them at solve time regardless of what a same-named data column supplies -- a data column only overrides a parameter that the model does *not* itself compute (this is why the `r_il4`/`r_il13` covariate trick earlier in this vignette works: those are plain `ini()` THETAs, never recalculated inside `model()`). The fix is to override the ETAs themselves (`etaka`, `etacl`, `etav`, `etalk1`, ...) as covariates -- since those are never recalculated, whatever value is supplied for a given `id` at every row is exactly what feeds into the model's own `ka <- exp(lka + etaka)` calculation, giving deterministic and reproducible per-patient parameters at any dose or time grid.
+**Overriding calculated parameters directly does not work.** It might seem natural to solve once, read off each patient's realized `ka`/`ke`/`vm`/`vc` (or `k1`, `k2`, ...) from the output columns, and then supply those values directly as covariates in later simulations. This fails silently: `ka`, `ke`, `vm`, `vc` (and `k1`, `k2`, ...) are assigned inside `model()` from THETA + ETA (e.g. `ka <- exp(lka + etaka)`), so rxode2 recalculates them at solve time regardless of what a same-named data column supplies -- a data column only overrides a parameter that the model does *not* itself compute (this is why the `r_il4`/`r_il13` covariate trick earlier in this vignette works: those are plain `ini()` THETAs, never recalculated inside `model()`). The fix is to override the ETAs themselves (`etaka`, `etake`, `etavm`, `etavc` `etalk1`, ...) as covariates -- since those are never recalculated, whatever value is supplied for a given `id` at every row is exactly what feeds into the model's own `ka <- exp(lka + etaka)` calculation, giving deterministic and reproducible per-patient parameters at any dose or time grid.
 
 ```{r vpop-roster-build}
 set.seed(3030)
@@ -895,7 +906,7 @@ dose_response_a <- purrr::map_dfr(inhibition_levels, function(r_val) {
   ev <- rxode2::et(seq(0, 24, by = 1)) |> rxode2::et(id = seq_len(n_per_arm))
   ev$cmt <- "barrier"
   p <- c(r_placebo = 1, r_il4 = r_val, r_il13 = r_val, r_il17 = 0, r_il22 = 0,
-         r_il31 = 0, r_tslp = 0, r_ox40l = 0, c_rifng = 0, e_a2 = 1)
+         r_il31 = 0, r_tslp = r_val, r_ox40l = 0, c_rifng = 0, e_a2 = 1)
   sim <- rxode2::rxSolve(mod_stoch, events = ev, nSub = n_per_arm, params = p,
                          inits = baseline_typ_named) |> as.data.frame()
   sim$inhibition <- r_val
@@ -961,8 +972,11 @@ simulate_dose <- function(maintenance_dose) {
     dplyr::left_join(pk_dose_cov, by = c("id", "time")) |>
     dplyr::left_join(vpop_roster |> dplyr::select(id, dplyr::all_of(names(qsp_omega_diag))), by = "id")
 
-  p_dose_other <- c(r_placebo = 1, r_il17 = 0, r_il22 = 0, r_il31 = 0,
-                    r_tslp = 0, r_ox40l = 0, c_rifng = 0, e_a2 = 1)
+ # p_dose_other <- c(r_placebo = 1, r_il17 = 0, r_il22 = 0, r_il31 = 0,
+ #                  r_tslp = 0, r_ox40l = 0, c_rifng = 0, e_a2 = 1)
+
+    p_dose_other <- c(r_placebo = 1, r_il17 = 0, r_il22 = 0, r_il31 = 0,
+                    r_ox40l = 0, c_rifng = 0, e_a2 = 1)                  
 
   qsp_dose_sim <- rxode2::rxSolve(mod_stoch, events = ev_qsp_dose,
                                   params = p_dose_other,
@@ -1040,7 +1054,7 @@ ev_fixed_matched$cmt <- "barrier"
 ev_fixed_matched <- as.data.frame(ev_fixed_matched) |>
   dplyr::left_join(vpop_roster |> dplyr::select(id, dplyr::all_of(names(qsp_omega_diag))), by = "id")
 p_fixed_matched <- c(r_placebo = 1, r_il4 = 0.99, r_il13 = 0.99, r_il17 = 0, r_il22 = 0,
-                     r_il31 = 0, r_tslp = 0, r_ox40l = 0, c_rifng = 0, e_a2 = 1)
+                     r_il31 = 0, r_tslp = 0.99, r_ox40l = 0, c_rifng = 0, e_a2 = 1)
 fixed_matched_sim <- rxode2::rxSolve(mod_stoch, events = ev_fixed_matched,
                                      params = p_fixed_matched,
                                      inits = baseline_typ_named) |> as.data.frame()
@@ -1059,7 +1073,7 @@ easi75_from_matched <- function(sim, label) {
 easi75_matched_compare <- dplyr::bind_rows(
   dose_response_b |> dplyr::filter(dose == 300) |>
     easi75_from_matched("PK-driven (300 mg q2w)"),
-  easi75_from_matched(fixed_matched_sim, "Fixed inhibition (r_il4 = r_il13 = 0.99)")
+  easi75_from_matched(fixed_matched_sim, "Fixed inhibition (r_il4 = r_il13 = r_tslp = 0.99)")
 )
 
 p <- ggplot(easi75_matched_compare, aes(x = time, y = EASI75, colour = mechanism)) +
